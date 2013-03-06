@@ -1,10 +1,13 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
-PRINC := "${@int(PRINC) + 14}"
+PRINC := "${@int(PRINC) + 16}"
 
 SRC_URI_append_armv7a = " \
-    file://keyboard-support-compilation-fix.patch"
+    file://keyboard-support-compilation-fix.patch \
+    file://0001-Implement-webOS-offscreen-rendering-platform-plugin-.patch"
 
 DEPENDS_append_armv7a = " virtual/egl"
+
+DEPENDS_append = " luna-sysmgr-ipc"
 
 # Enable dbus support needed for some components inside webos-ports
 DEPENDS += "dbus"

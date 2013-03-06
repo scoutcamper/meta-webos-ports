@@ -1,0 +1,2436 @@
+From 92579773f194fc098abd57f6b28f7422c4d99fd9 Mon Sep 17 00:00:00 2001
+From: Simon Busch <morphis@gravedo.de>
+Date: Mon, 25 Feb 2013 09:37:04 +0100
+Subject: [PATCH] Implement webOS offscreen rendering platform plugin through
+ libhybris
+
+This implements offscreen rendering and doesn't depend on IPC communication with the
+luna-sysmgr anymore. All window creation and management is now up to the instance creating
+the associated widget. This makes it possible to use the QPA in webOS outside of
+webappmanager in normal qt applications.
+
+Open-webOS-DCO-1.0-Signed-off-by: Simon Busch <morphis@gravedo.de>
+Open-webOS-DCO-1.0-Signed-off-by: Florian Haenel <florian.hanel@palm.com>
+---
+ src/gui/kernel/qwidget.cpp                         |   12 +-
+ src/plugins/platforms/palm/palm.pro                |    6 +-
+ src/plugins/platforms/palm/qeglfsintegration.cpp   |    7 +
+ src/plugins/platforms/palm/qeglfsintegration.h     |    4 +
+ .../platforms/palm/qeglfsnativeinterface.cpp       |   39 +++
+ src/plugins/platforms/palm/qeglfsnativeinterface.h |   38 +++
+ src/plugins/platforms/palm/qeglfsscreen.h          |    2 +
+ .../platforms/webos/hybriscompositorclient.cpp     |   85 ++++++
+ .../platforms/webos/hybriscompositorclient.h       |   48 ++++
+ src/plugins/platforms/webos/main.cpp               |   15 +-
+ src/plugins/platforms/webos/qwebosfontdatabase.cpp |    4 -
+ src/plugins/platforms/webos/qwebosglcontext.cpp    |  213 ++++++++++++++
+ src/plugins/platforms/webos/qwebosglcontext.h      |   60 ++++
+ src/plugins/platforms/webos/qwebosintegration.cpp  |   90 +++---
+ src/plugins/platforms/webos/qwebosintegration.h    |   45 ++-
+ src/plugins/platforms/webos/qwebosipcclient.cpp    |   84 ++++++
+ src/plugins/platforms/webos/qwebosipcclient.h      |   48 ++++
+ .../platforms/webos/qwebosnativeinterface.cpp      |   32 +++
+ .../platforms/webos/qwebosnativeinterface.h        |   32 +++
+ src/plugins/platforms/webos/qwebosscreen.cpp       |  256 +----------------
+ src/plugins/platforms/webos/qwebosscreen.h         |   37 +--
+ src/plugins/platforms/webos/qweboswindow.cpp       |  235 ++++++++++++++--
+ src/plugins/platforms/webos/qweboswindow.h         |   68 ++++-
+ .../platforms/webos/qweboswindowsurface.cpp        |  291 +++-----------------
+ src/plugins/platforms/webos/qweboswindowsurface.h  |   48 ++--
+ src/plugins/platforms/webos/webos.pro              |   26 +-
+ 26 files changed, 1179 insertions(+), 646 deletions(-)
+ create mode 100644 src/plugins/platforms/palm/qeglfsnativeinterface.cpp
+ create mode 100644 src/plugins/platforms/palm/qeglfsnativeinterface.h
+ create mode 100644 src/plugins/platforms/webos/hybriscompositorclient.cpp
+ create mode 100644 src/plugins/platforms/webos/hybriscompositorclient.h
+ create mode 100644 src/plugins/platforms/webos/qwebosglcontext.cpp
+ create mode 100644 src/plugins/platforms/webos/qwebosglcontext.h
+ create mode 100644 src/plugins/platforms/webos/qwebosipcclient.cpp
+ create mode 100644 src/plugins/platforms/webos/qwebosipcclient.h
+ create mode 100644 src/plugins/platforms/webos/qwebosnativeinterface.cpp
+ create mode 100644 src/plugins/platforms/webos/qwebosnativeinterface.h
+
+diff --git a/src/gui/kernel/qwidget.cpp b/src/gui/kernel/qwidget.cpp
+index f18f5f9..d8560ce 100644
+--- a/src/gui/kernel/qwidget.cpp
++++ b/src/gui/kernel/qwidget.cpp
+@@ -1356,9 +1356,15 @@ void QWidgetPrivate::init(QWidget *parentWidget, Qt::WindowFlags f)
+ 
+     q->setAttribute(Qt::WA_WState_Hidden);
+ 
+-#ifndef QT_WEBOS
+-    //give potential windows a bigger "pre-initial" size; create_sys() will give them a new size later
+-    data.crect = parentWidget ? QRect(0,0,100,30) : QRect(0,0,640,480);
++#ifdef QT_WEBOS
++    if (isGLWidget) {
++        // Don't waste GPU mem for unnecessary large egl surface until resized by application
++        data.crect = QRect(0, 0, 1, 1);
++    }
++    else {
++        //give potential windows a bigger "pre-initial" size; create_sys() will give them a new size later
++        data.crect = parentWidget ? QRect(0,0,100,30) : QRect(0,0,640,480);
++    }
+ #else // QT_WEBOS
+ #if defined(Q_WS_QWS)
+     const QScreen *screen = QScreen::instance();
+diff --git a/src/plugins/platforms/palm/palm.pro b/src/plugins/platforms/palm/palm.pro
+index c8f4e83..0ab2aa2 100644
+--- a/src/plugins/platforms/palm/palm.pro
++++ b/src/plugins/platforms/palm/palm.pro
+@@ -33,14 +33,16 @@ webos {
+                    ../eglconvenience/qeglplatformcontext.cpp \
+                    qeglfswindow.cpp \
+                    qeglfswindowsurface.cpp \
+-                   qeglfsscreen.cpp
++                   qeglfsscreen.cpp \
++                   qeglfsnativeinterface.cpp
+ 
+         HEADERS += qeglfsintegration.h \
+                    ../eglconvenience/qeglconvenience.h \
+                    ../eglconvenience/qeglplatformcontext.h \
+                    qeglfswindow.h \
+                    qeglfswindowsurface.h \
+-                   qeglfsscreen.h
++                   qeglfsscreen.h \
++                   qeglfsnativeinterface.h
+         DEFINES += TARGET_DEVICE
+         LIBS_PRIVATE += -lnyx -ldl
+     }
+diff --git a/src/plugins/platforms/palm/qeglfsintegration.cpp b/src/plugins/platforms/palm/qeglfsintegration.cpp
+index 49ba634..e0bf75f 100644
+--- a/src/plugins/platforms/palm/qeglfsintegration.cpp
++++ b/src/plugins/platforms/palm/qeglfsintegration.cpp
+@@ -67,6 +67,7 @@ QEglFSIntegration::QEglFSIntegration(bool soft)
+       m_clipboard(new QWebOSClipboard())
+ {
+     m_primaryScreen = new QEglFSScreen(EGL_DEFAULT_DISPLAY);
++    m_nativeInterface = new QEglFSNativeInterface(m_primaryScreen);
+     m_tpHandler = new QPAHiddTpHandler(m_primaryScreen->geometry().width(), m_primaryScreen->geometry().height());
+     m_keyboard = new NyxKeyboardHandler;
+     this->soft = soft;
+@@ -117,4 +118,10 @@ QPlatformFontDatabase *QEglFSIntegration::fontDatabase() const
+     return mFontDb;
+ }
+ 
++QPlatformNativeInterface* QEglFSIntegration::nativeInterface() const
++{
++    qDebug() << __PRETTY_FUNCTION__;
++    return m_nativeInterface;
++}
++
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/palm/qeglfsintegration.h b/src/plugins/platforms/palm/qeglfsintegration.h
+index 69d5fb7..bc42b71 100644
+--- a/src/plugins/platforms/palm/qeglfsintegration.h
++++ b/src/plugins/platforms/palm/qeglfsintegration.h
+@@ -52,6 +52,8 @@
+ #include <QtGui/QPlatformIntegration>
+ #include <QtGui/QPlatformScreen>
+ 
++#include "qeglfsnativeinterface.h"
++
+ QT_BEGIN_HEADER
+ 
+ QT_BEGIN_NAMESPACE
+@@ -69,11 +71,13 @@ public:
+ 
+     QPlatformFontDatabase *fontDatabase() const;
+     virtual QPlatformClipboard *clipboard() const;
++    virtual QPlatformNativeInterface* nativeInterface() const;
+ 
+ private:
+     QPlatformFontDatabase *mFontDb;
+     QList<QPlatformScreen *> mScreens;
+     QEglFSScreen *m_primaryScreen;
++    QEglFSNativeInterface *m_nativeInterface;
+ 
+     QPAHiddTpHandler* m_tpHandler;
+     NyxKeyboardHandler* m_keyboard;
+diff --git a/src/plugins/platforms/palm/qeglfsnativeinterface.cpp b/src/plugins/platforms/palm/qeglfsnativeinterface.cpp
+new file mode 100644
+index 0000000..d9326a6
+--- /dev/null
++++ b/src/plugins/platforms/palm/qeglfsnativeinterface.cpp
+@@ -0,0 +1,39 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#include "qeglfsnativeinterface.h"
++
++#include <QtGui/private/qapplication_p.h>
++#include <QDebug>
++
++QEglFSNativeInterface::QEglFSNativeInterface(QEglFSScreen *screen)
++    : m_screen(screen)
++{
++    qDebug() << __PRETTY_FUNCTION__;
++}
++
++void* QEglFSNativeInterface::nativeResourceForWidget(const QByteArray &resourceString, QWidget *widget)
++{
++    QByteArray lowerCaseResource = resourceString.toLower();
++
++    qDebug() << __PRETTY_FUNCTION__;
++
++    if (lowerCaseResource == "display" && m_screen)
++        return m_screen->display();
++
++    return NULL;
++}
+diff --git a/src/plugins/platforms/palm/qeglfsnativeinterface.h b/src/plugins/platforms/palm/qeglfsnativeinterface.h
+new file mode 100644
+index 0000000..304c6d1
+--- /dev/null
++++ b/src/plugins/platforms/palm/qeglfsnativeinterface.h
+@@ -0,0 +1,38 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++
++#ifndef QWEBOSNATIVEINTERFACE_H
++#define QWEBOSNATIVEINTERFACE_H
++
++#include <QtGui/QPlatformNativeInterface>
++#include "qeglfsscreen.h"
++
++class QEglFSNativeInterface : public QPlatformNativeInterface
++{
++public:
++    QEglFSNativeInterface(QEglFSScreen *screen);
++
++    void *nativeResourceForWidget(const QByteArray &resourceString,
++                                  QWidget *widget);
++
++private:
++    QEglFSScreen *m_screen;
++};
++
++
++#endif // QWEBOSNATIVEINTERFACE_H
+diff --git a/src/plugins/platforms/palm/qeglfsscreen.h b/src/plugins/platforms/palm/qeglfsscreen.h
+index 211bb3c..b91d238 100644
+--- a/src/plugins/platforms/palm/qeglfsscreen.h
++++ b/src/plugins/platforms/palm/qeglfsscreen.h
+@@ -63,6 +63,8 @@ public:
+     int depth() const;
+     QImage::Format format() const;
+ 
++    EGLDisplay display() const { return m_dpy; }
++
+     QPlatformGLContext *platformContext() const;
+ 
+ private:
+diff --git a/src/plugins/platforms/webos/hybriscompositorclient.cpp b/src/plugins/platforms/webos/hybriscompositorclient.cpp
+new file mode 100644
+index 0000000..e577453
+--- /dev/null
++++ b/src/plugins/platforms/webos/hybriscompositorclient.cpp
+@@ -0,0 +1,85 @@
++/**
++ *  Copyright (c) 2009-2012 Hewlett-Packard Development Company, L.P.
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <errno.h>
++#include <QTimer>
++#include <QDebug>
++#include <stdint.h>
++#include <unistd.h>
++
++#include "hybriscompositorclient.h"
++
++struct compositor_ctrl_hdr {
++    uint32_t windowId;
++    uint32_t command;
++};
++
++HybrisCompositorClient::HybrisCompositorClient(QObject *parent)
++    : QObject(parent),
++      m_socketPath("/tmp/sysmgr_compositor")
++{
++    QTimer::singleShot(0, this, SLOT(init()));
++}
++
++HybrisCompositorClient::~HybrisCompositorClient()
++{
++}
++
++void HybrisCompositorClient::init()
++{
++    struct sockaddr_un socketAddr;
++
++    m_socketFd = ::socket(PF_LOCAL, SOCK_STREAM, 0);
++    if (m_socketFd < 0) {
++        g_critical("%s: %d Failed to create socket: %s",
++                   __PRETTY_FUNCTION__, __LINE__, strerror(errno));
++        return false;
++    }
++
++    memset(&socketAddr, 0, sizeof(socketAddr));
++    socketAddr.sun_family = AF_LOCAL;
++    strncpy(socketAddr.sun_path, m_socketPath.c_str(), G_N_ELEMENTS(socketAddr.sun_path));
++    socketAddr.sun_path[G_N_ELEMENTS(socketAddr.sun_path)-1] = '\0';
++
++    if (::connect(m_socketFd, (struct sockaddr*) &socketAddr,
++                  SUN_LEN(&socketAddr)) != 0) {
++        g_critical("%s:%d Failed to connect to socket: %s",
++                   __PRETTY_FUNCTION__, __LINE__, strerror(errno));
++        emit serverDisconnected();
++        return;
++    }
++
++    emit serverConnected();
++}
++
++void HybrisCompositorClient::postBuffer(int winId, OffscreenNativeWindowBuffer *buffer)
++{
++    struct compositor_ctrl_hdr hdr;
++    int ret;
++
++    memset(&hdr, 0, sizeof(struct compositor_ctrl_hdr));
++    hdr.windowId = winId;
++    hdr.command = 1; /* default */
++
++    ret = write(m_socketFd, &hdr, sizeof(struct compositor_ctrl_hdr));
++
++    buffer->writeToFd(m_socketFd);
++}
+diff --git a/src/plugins/platforms/webos/hybriscompositorclient.h b/src/plugins/platforms/webos/hybriscompositorclient.h
+new file mode 100644
+index 0000000..07326f7
+--- /dev/null
++++ b/src/plugins/platforms/webos/hybriscompositorclient.h
+@@ -0,0 +1,48 @@
++/**
++ *  Copyright (c) 2009-2012 Hewlett-Packard Development Company, L.P.
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++
++#ifndef HYBRISCOMPOSITORCLIENT_H
++#define HYBRISCOMPOSITORCLIENT_H
++
++#include <QObject>
++#include <glib.h>
++#include <string>
++
++#include <EGL/eglhybris.h>
++
++class HybrisCompositorClient : QObject
++{
++    Q_OBJECT
++public:
++    HybrisCompositorClient(QObject *parent = 0);
++    ~HybrisCompositorClient();
++
++    void postBuffer(int winId, OffscreenNativeWindowBuffer *buffer);
++
++signals:
++    void serverDisconnected();
++    void serverConnected();
++
++private:
++    int m_socketFd;
++    std::string m_socketPath;
++
++private Q_SLOTS:
++    void init();
++};
++
++#endif /* HYBRISCOMPOSITORCLIENT_H */
+diff --git a/src/plugins/platforms/webos/main.cpp b/src/plugins/platforms/webos/main.cpp
+index 33aa55c..b03f387 100644
+--- a/src/plugins/platforms/webos/main.cpp
++++ b/src/plugins/platforms/webos/main.cpp
+@@ -42,7 +42,7 @@
+ 
+ #include <QtGui/QPlatformIntegrationPlugin>
+ #include "qwebosintegration.h"
+-
++#include <QDebug>
+ QT_BEGIN_NAMESPACE
+ 
+ class QWebOSIntegrationPlugin : public QPlatformIntegrationPlugin
+@@ -54,25 +54,16 @@ public:
+ 
+ QStringList QWebOSIntegrationPlugin::keys() const
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+     QStringList list;
+     list << "webos";
+-    list << "webos-offscreen";
+     return list;
+ }
+ 
+ QPlatformIntegration* QWebOSIntegrationPlugin::create(const QString& system, const QStringList& paramList)
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
++    qDebug() << __PRETTY_FUNCTION__ << "****" << system << paramList;
+     Q_UNUSED(paramList);
+-    if (system.toLower() == "webos") {
+-        return new QWebOSIntegration(false);
+-    }
+-    else if(system.toLower() == "webos-offscreen") {
+-        return new QWebOSIntegration(true);
+-    }
+-
+-    return 0;
++    return new QWebOSIntegration();
+ }
+ 
+ Q_EXPORT_PLUGIN2(webosintegration, QWebOSIntegrationPlugin)
+diff --git a/src/plugins/platforms/webos/qwebosfontdatabase.cpp b/src/plugins/platforms/webos/qwebosfontdatabase.cpp
+index a7cd16e..f416a0c 100644
+--- a/src/plugins/platforms/webos/qwebosfontdatabase.cpp
++++ b/src/plugins/platforms/webos/qwebosfontdatabase.cpp
+@@ -467,7 +467,6 @@ static QFont::Style determineStyleFromTrueTypeSelection(unsigned short fsSelecti
+ 
+ QWebOSFontDatabase::QWebOSFontDatabase() : m_initialized(false), m_debug(false), m_qApp(NULL)
+ {
+-    qDebug() << __PRETTY_FUNCTION__;
+     // These are the defaults that will be used
+     setFontConfig(FontConfigSystem, "webos-system-fonts.xml");
+     setFontConfig(FontConfigFallback, "webos-fallback-fonts.xml");
+@@ -475,7 +474,6 @@ QWebOSFontDatabase::QWebOSFontDatabase() : m_initialized(false), m_debug(false),
+ 
+ void QWebOSFontDatabase::setFontConfig(FontConfig config, const QString& location)
+ {
+-    qDebug() << __PRETTY_FUNCTION__ << config << location;
+     m_fontConfig.insert(config, location);
+ }
+ 
+@@ -514,7 +512,6 @@ void QWebOSFontDatabase::populateFontDatabase()
+     }
+ 
+     QString systemFontsFileName = resolveFontPathFor(FontConfigSystem);
+-    qDebug() << __PRETTY_FUNCTION__ << systemFontsFileName;
+     QDomDocument systemDoc("systemFonts");
+     QFile systemFontsFile(systemFontsFileName);
+ 
+@@ -561,7 +558,6 @@ void QWebOSFontDatabase::populateFontDatabase()
+     QString fallbackFontsFileName = resolveFontPathFor(FontConfigFallback);
+     QFile fallbackFontsFile(fallbackFontsFileName);
+     if (fallbackFontsFile.exists()) {
+-        qDebug() << __PRETTY_FUNCTION__ << fallbackFontsFileName;
+         QDomDocument fallbackDoc("fallbackFonts");
+ 
+         if (!fallbackFontsFile.open(QIODevice::ReadOnly)) {
+diff --git a/src/plugins/platforms/webos/qwebosglcontext.cpp b/src/plugins/platforms/webos/qwebosglcontext.cpp
+new file mode 100644
+index 0000000..d09eebb
+--- /dev/null
++++ b/src/plugins/platforms/webos/qwebosglcontext.cpp
+@@ -0,0 +1,213 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#include "qweboswindow.h"
++#include <QDebug>
++#include "qwebosglcontext.h"
++#include "../eglconvenience/qeglconvenience.h"
++#include "../eglconvenience/qeglplatformcontext.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++    EGLDisplay* disp = NULL;
++    void setEglSwapInterval(int interval) {
++        eglSwapInterval(disp, interval);
++    }
++#ifdef __cplusplus
++}
++#endif
++
++EGLDisplay QWebOSGLContext::s_eglDisplay = 0;
++
++static void QWebOSGLContext::initialize(EGLNativeDisplayType display)
++{
++    EGLint major, minor;
++
++   if (!eglBindAPI(EGL_OPENGL_ES_API)) {
++        qWarning("Could not bind GL_ES API\n");
++        qFatal("EGL error");
++    }
++
++    s_eglDisplay = eglGetDisplay(display);
++    if (s_eglDisplay == EGL_NO_DISPLAY)
++        qDebug() << "Could not open egl display\n";
++
++    if (!eglInitialize(s_eglDisplay, &major, &minor))
++        qDebug() << "Could not initialize egl display";
++
++    int swapInterval = 1;
++    QByteArray swapIntervalString = qgetenv("QT_QPA_EGLFS_SWAPINTERVAL");
++    if (!swapIntervalString.isEmpty()) {
++        bool ok;
++        swapInterval = swapIntervalString.toInt(&ok);
++        if (!ok)
++            swapInterval = 1;
++    }
++
++    eglSwapInterval(s_eglDisplay, swapInterval);
++}
++
++QWebOSGLContext::QWebOSGLContext(QWebOSWindow* platformWindow)
++        : m_platformWindow(platformWindow)
++        , m_eglSurface(EGL_NO_SURFACE)
++{
++    m_windowFormat = QPlatformWindowFormat::defaultFormat();
++    m_windowFormat.setWindowApi(QPlatformWindowFormat::OpenGL);
++
++    QByteArray depthString = qgetenv("QT_QPA_EGLFS_DEPTH");
++    if (depthString.toInt() == 16) {
++        m_windowFormat.setDepth(16);
++        m_windowFormat.setRedBufferSize(5);
++        m_windowFormat.setGreenBufferSize(6);
++        m_windowFormat.setBlueBufferSize(5);
++    }
++    else {
++        m_windowFormat.setDepth(32);
++        m_windowFormat.setRedBufferSize(8);
++        m_windowFormat.setGreenBufferSize(8);
++        m_windowFormat.setBlueBufferSize(8);
++    }
++
++    if (!qgetenv("QT_QPA_EGLFS_MULTISAMPLE").isEmpty())
++        m_windowFormat.setSampleBuffers(true);
++
++    EGLBoolean eglResult = eglBindAPI(EGL_OPENGL_ES_API);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to set EGL API, err=%d", eglGetError());
++
++    m_eglConfig = q_configFromQPlatformWindowFormat(s_eglDisplay, m_windowFormat);
++
++    EGLint contextAttrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
++    m_eglContext = eglCreateContext(s_eglDisplay, m_eglConfig, EGL_NO_CONTEXT, contextAttrs);
++    if (m_eglContext == EGL_NO_CONTEXT)
++        qFatal("QWebOS: failed to create EGL context, err=%d", eglGetError());
++
++    createSurface();
++}
++
++QWebOSGLContext::~QWebOSGLContext()
++{
++   if (m_eglContext != EGL_NO_CONTEXT)
++        eglDestroyContext(s_eglDisplay, m_eglContext);
++
++   destroySurface();
++}
++
++void QWebOSGLContext::createSurface()
++{
++    m_eglSurface = eglCreateWindowSurface(s_eglDisplay, m_eglConfig,
++                                          static_cast<ANativeWindow*>(m_platformWindow),
++                                          NULL);
++
++    if (m_eglSurface == EGL_NO_SURFACE) {
++        qDebug("Could not create the egl surface: error = 0x%x\n", eglGetError());
++        eglTerminate(s_eglDisplay);
++        qFatal("EGL error");
++    }
++
++    EGLint w, h;
++    eglQuerySurface(s_eglDisplay, m_eglSurface, EGL_WIDTH, &w);
++    eglQuerySurface(s_eglDisplay, m_eglSurface, EGL_HEIGHT, &h);
++    m_surfaceSize = QSize(w,h);
++}
++
++bool QWebOSGLContext::isCurrent() const
++{
++    return (eglGetCurrentContext() == m_eglContext);
++}
++
++void QWebOSGLContext::destroySurface()
++{
++    if (m_eglSurface != EGL_NO_SURFACE) {
++        EGLBoolean eglResult = eglDestroySurface(s_eglDisplay, m_eglSurface);
++        if (eglResult != EGL_TRUE)
++            qFatal("QWebOS: failed to destroy EGL surface, err=%d", eglGetError());
++
++        m_eglSurface = EGL_NO_SURFACE;
++    }
++}
++
++void QWebOSGLContext::swapBuffers()
++{
++    EGLBoolean eglResult = eglBindAPI(EGL_OPENGL_ES_API);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to set EGL API, err=%d", eglGetError());
++
++    eglResult = eglSwapBuffers(s_eglDisplay, m_eglSurface);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to swap EGL buffers, err=%d", eglGetError());
++
++    QSize currentSize = m_platformWindow->geometry().size();
++    if (currentSize != m_surfaceSize) {
++        resizeSurface(currentSize);
++    }
++}
++
++void QWebOSGLContext::resizeSurface(const QSize& size)
++{
++    bool restoreCurrent = false;
++    if (isCurrent()) {
++        doneCurrent();
++        restoreCurrent = true;
++    }
++
++    destroySurface();
++    m_platformWindow->resize(size.width(), size.height());
++    m_surfaceSize = size;
++    createSurface();
++
++    if (restoreCurrent) {
++        makeCurrent();
++    }
++}
++
++void QWebOSGLContext::makeCurrent()
++{
++    EGLBoolean eglResult = eglBindAPI(EGL_OPENGL_ES_API);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to set EGL API, err=%d", eglGetError());
++
++    QPlatformGLContext::makeCurrent();
++
++    eglResult = eglMakeCurrent(s_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to set current EGL context, err=%X", eglGetError());
++}
++
++void QWebOSGLContext::doneCurrent()
++{
++    QPlatformGLContext::doneCurrent();
++
++    EGLBoolean eglResult = eglBindAPI(EGL_OPENGL_ES_API);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to set EGL API, err=%d", eglGetError());
++
++    eglResult = eglMakeCurrent(s_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to clear current EGL context, err=%d", eglGetError());
++}
++
++void* QWebOSGLContext::getProcAddress(const QString& procName)
++{
++    EGLBoolean eglResult = eglBindAPI(EGL_OPENGL_ES_API);
++    if (eglResult != EGL_TRUE)
++        qFatal("QWebOS: failed to set EGL API, err=%d", eglGetError());
++
++    return (void *)eglGetProcAddress( procName.toAscii().constData() );
++}
++
+diff --git a/src/plugins/platforms/webos/qwebosglcontext.h b/src/plugins/platforms/webos/qwebosglcontext.h
+new file mode 100644
+index 0000000..6775f01
+--- /dev/null
++++ b/src/plugins/platforms/webos/qwebosglcontext.h
+@@ -0,0 +1,60 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#ifndef QWEBOSGLCONTEXT_H
++#define QWEBOSGLCONTEXT_H
++
++#include <QPlatformGLContext>
++#include <EGL/egl.h>
++class QWebOSWindow;
++
++class QWebOSGLContext : public QPlatformGLContext
++{
++public:
++    static void initialize(EGLNativeDisplayType display);
++    QWebOSGLContext(QWebOSWindow* platformWindow);
++    ~QWebOSGLContext();
++
++    //overloads from QlatformGLContext
++    virtual void makeCurrent();
++    virtual void doneCurrent();
++    virtual void swapBuffers();
++    virtual void* getProcAddress(const QString& procName);
++
++    virtual QPlatformWindowFormat platformWindowFormat() const { return m_windowFormat; }
++    QSize surfaceSize() const {
++        return m_surfaceSize;
++    }
++
++    static EGLDisplay display() { return s_eglDisplay; }
++
++private:
++    static EGLDisplay s_eglDisplay;
++    EGLContext m_eglContext;
++    // FIXME should the surface be part of a proper surface class
++    EGLSurface m_eglSurface;
++    EGLConfig m_eglConfig;
++    QSize m_surfaceSize;
++    QWebOSWindow* m_platformWindow;
++    QPlatformWindowFormat m_windowFormat;
++
++    void createSurface();
++    void destroySurface();
++    bool isCurrent() const;
++    void resizeSurface(const QSize& size);
++};
++#endif
+diff --git a/src/plugins/platforms/webos/qwebosintegration.cpp b/src/plugins/platforms/webos/qwebosintegration.cpp
+index c4dd609..5b0f2bf 100644
+--- a/src/plugins/platforms/webos/qwebosintegration.cpp
++++ b/src/plugins/platforms/webos/qwebosintegration.cpp
+@@ -1,5 +1,6 @@
+ /**
+  *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -16,15 +17,22 @@
+ 
+ #include "qwebosintegration.h"
+ 
++#include "qwebosipcclient.h"
+ #include "qweboswindow.h"
+ #include "qweboswindowsurface.h"
+-
+-#include <QtGui/QPlatformWindow>
++#include "qwebosglcontext.h"
++#include "qwebosscreen.h"
+ #include "qwebosclipboard.h"
+ #include "qwebosfontdatabase.h"
++#include "qwebosnativeinterface.h"
++#include "hybriscompositorclient.h"
++
++#include <QDebug>
++#include <QtGui/QPlatformWindow>
+ #include <QtGui/QPlatformWindowFormat>
+ #include <QtGui/private/qpixmap_raster_p.h>
+ #include <QtOpenGL/private/qpixmapdata_egl_p.h>
++#include <QtOpenGL/private/qpixmapdata_gl_p.h>
+ #include <EGL/egl.h>
+ 
+ #include <glib.h>
+@@ -32,66 +40,84 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-QPlatformClipboard* QWebOSIntegration::clipboard() const {
+-    return (QWebOSClipboard*)m_clipboard;
++QPlatformClipboard* QWebOSIntegration::clipboard() const
++{
++    return (QWebOSClipboard*) m_clipboard;
+ }
+ 
+-QWebOSIntegration::QWebOSIntegration(bool offscreen)
+-    : mFontDb(new QWebOSFontDatabase())
+-      ,m_offscreen(offscreen)
++QWebOSIntegration::QWebOSIntegration()
++    : m_fontDb(new QWebOSFontDatabase()),
++      m_nativeInterface(new QWebOSNativeInterface()),
++      m_primaryScreen(0),
++      m_ipcClient(0)
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-//QApplication::setStyle(new QWebOSStyle);
++    qDebug() << __PRETTY_FUNCTION__;
++
+     m_clipboard = new QWebOSClipboard();
+-    m_primaryScreen = new QWebOSScreen((EGLNativeDisplayType) 1/*EGL_DEFAULT_DISPLAY*/, offscreen);
+-    if(!offscreen) {
+-//        m_tpHandler = new QPAHiddTpHandler(m_primaryScreen);
+-//        m_kbdHandler = new QPAHiddKbdHandler;
++
++    m_primaryScreen = new QWebOSScreen();
++    m_screens.append(m_primaryScreen);
++
++    // Only create IPC client when we're not running in context of the webappmanager
++    if (::getenv("QT_WEBOS_WEBAPPMGR") == 0) {
++        qDebug() << __PRETTY_FUNCTION__ << "Not running in context of webappmanager";
++        m_context = g_main_context_default();
++        m_mainLoop = g_main_loop_new(m_context, TRUE);
++        m_ipcClient = new QWebOSIpcClient(m_mainLoop);
++        qDebug() << __PRETTY_FUNCTION__ << "Not running in context of webappmanager 2";
+     }
+-    
+-    mScreens.append(m_primaryScreen);
+-#ifdef QEGL_EXTRA_DEBUG
+-    qWarning("QEglIntegration\n");
+-#endif
++
++    QWebOSGLContext::initialize(EGL_DEFAULT_DISPLAY);
++}
++
++QWebOSIntegration::~QWebOSIntegration()
++{
++    if (m_ipcClient)
++        delete m_ipcClient;
+ }
+ 
+ bool QWebOSIntegration::hasCapability(QPlatformIntegration::Capability cap) const
+ {
+     switch (cap) {
+-    case ThreadedPixmaps: return true;
+-    default: return QPlatformIntegration::hasCapability(cap);
++        case ThreadedPixmaps:
++            return true;
++        default:
++            return QPlatformIntegration::hasCapability(cap);
+     }
+ }
+ 
+ QPixmapData *QWebOSIntegration::createPixmapData(QPixmapData::PixelType type) const
+ {
+-#ifdef QEGL_EXTRA_DEBUG
+-    qWarning("QEglIntegration::createPixmapData %d\n", type);
+-#endif
+-    return new QRasterPixmapData(type);
++    return new QGLPixmapData(type);
+ }
+ 
+ QPlatformWindow *QWebOSIntegration::createPlatformWindow(QWidget *widget, WId winId) const
+ {
+-//    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << winId << "****************";
++    qDebug() << __PRETTY_FUNCTION__;
+     Q_UNUSED(winId);
+-    return new QWebOSWindow(widget, m_primaryScreen);
++    return new QWebOSWindow(m_ipcClient, &m_compositorClient, widget, m_primaryScreen);
+ }
+ 
+ 
+ QWindowSurface *QWebOSIntegration::createWindowSurface(QWidget *widget, WId winId) const
+ {
+-//    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+     Q_UNUSED(winId);
+ 
+-    GMainContext* context = g_main_context_default();
+-    GMainLoop* loop = g_main_loop_new(context, TRUE);
+-    return new QWebOSWindowSurface(m_primaryScreen, widget, loop);
++    if(widget->platformWindowFormat().windowApi() == QPlatformWindowFormat::OpenGL)
++        return new QWebOSGLWindowSurface(m_primaryScreen, widget);
++
++    qFatal("non-opengl windowsurface not implemented yet!");
++    return 0;
++}
++
++QPlatformFontDatabase* QWebOSIntegration::fontDatabase() const
++{
++    return m_fontDb;
+ }
+ 
+-QPlatformFontDatabase *QWebOSIntegration::fontDatabase() const
++QPlatformNativeInterface* QWebOSIntegration::nativeInterface() const
+ {
+-    return mFontDb;
++    return m_nativeInterface;
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/webos/qwebosintegration.h b/src/plugins/platforms/webos/qwebosintegration.h
+index 252df4a..b39c7cc 100644
+--- a/src/plugins/platforms/webos/qwebosintegration.h
++++ b/src/plugins/platforms/webos/qwebosintegration.h
+@@ -1,12 +1,30 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
+ 
+ #ifndef WEBOSINTEGRATION_H
+ #define WEBOSINTEGRATION_H
+ 
+-#include "qwebosscreen.h"
+ 
+ #include <QtGui/QPlatformIntegration>
+ #include <QtGui/QPlatformScreen>
+-#include "qwebosclipboard.h"
++
++#include <glib.h>
++
++#include "hybriscompositorclient.h"
+ 
+ QT_BEGIN_HEADER
+ 
+@@ -14,26 +32,37 @@ QT_BEGIN_NAMESPACE
+ 
+ class QWebOSClipboard;
+ class QWebOSFontDatabase;
++class QWebOSScreen;
++class QWebOSNativeInterface;
++class QWebOSIpcClient;
+ 
+ class QWebOSIntegration : public QPlatformIntegration
+ {
+ public:
+-    QWebOSIntegration(bool offscreen);
++    QWebOSIntegration();
++    virtual ~QWebOSIntegration();
++
+     bool hasCapability(QPlatformIntegration::Capability cap) const;
+     QPixmapData *createPixmapData(QPixmapData::PixelType type) const;
+     QPlatformWindow *createPlatformWindow(QWidget *widget, WId winId) const;
+     QWindowSurface *createWindowSurface(QWidget *widget, WId winId) const;
+ 
+-    QList<QPlatformScreen *> screens() const { return mScreens; }
++    QList<QPlatformScreen *> screens() const { return m_screens; }
++
++    virtual QPlatformNativeInterface* nativeInterface() const;
+ 
+     QPlatformFontDatabase *fontDatabase() const;
+     virtual QPlatformClipboard *clipboard() const;
+ private:
+-    QWebOSFontDatabase *mFontDb;
+-    QList<QPlatformScreen *> mScreens;
++    QWebOSFontDatabase *m_fontDb;
++    QList<QPlatformScreen *> m_screens;
+     QWebOSScreen *m_primaryScreen;
+-    bool m_offscreen;
+-    QWebOSClipboard* m_clipboard;
++    QWebOSClipboard *m_clipboard;
++    QWebOSNativeInterface *m_nativeInterface;
++    HybrisCompositorClient m_compositorClient;
++    GMainContext *m_context;
++    GMainLoop *m_mainLoop;
++    QWebOSIpcClient *m_ipcClient;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/webos/qwebosipcclient.cpp b/src/plugins/platforms/webos/qwebosipcclient.cpp
+new file mode 100644
+index 0000000..1936aa4
+--- /dev/null
++++ b/src/plugins/platforms/webos/qwebosipcclient.cpp
+@@ -0,0 +1,84 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#include "qwebosipcclient.h"
++#include "qweboswindow.h"
++
++#include <QDebug>
++
++#define MESSAGES_INTERNAL_FILE "SysMgrMessagesInternal.h"
++#include <PIpcMessageMacros.h>
++#include <PIpcChannel.h>
++
++QT_BEGIN_NAMESPACE
++
++QWebOSIpcClient::QWebOSIpcClient(GMainLoop *loop)
++    : PIpcClient("sysmgr", "webos-client", loop)
++{
++    qDebug() << __PRETTY_FUNCTION__;
++    g_main_loop_run(mainLoop());
++    qDebug() << __PRETTY_FUNCTION__ << "2";
++}
++
++void QWebOSIpcClient::serverConnected(PIpcChannel* channel)
++{
++    qDebug() << __PRETTY_FUNCTION__ << "IPC Server connected";
++    g_main_loop_quit(mainLoop());
++    setChannel(channel);
++}
++
++void QWebOSIpcClient::serverDisconnected()
++{
++    setChannel(0);
++}
++
++void QWebOSIpcClient::onMessageReceived(const PIpcMessage& msg)
++{
++    QWebOSWindow *window = 0;
++
++    if (!(window = platformWindowFromId(msg.routing_id())))
++        return;
++
++    bool msgIsOk;
++    IPC_BEGIN_MESSAGE_MAP(QWebOSWindow, msg, msgIsOk)
++        IPC_MESSAGE_FORWARD(View_Focus, window, QWebOSWindow::handleFocus)
++        IPC_MESSAGE_FORWARD(View_Resize, window, QWebOSWindow::handleResize)
++        IPC_MESSAGE_FORWARD(View_FullScreenEnabled, window, QWebOSWindow::handleFullScreenEnabled)
++        IPC_MESSAGE_FORWARD(View_FullScreenDisabled, window, QWebOSWindow::handleFullScreenDisabled)
++        IPC_MESSAGE_FORWARD(View_Pause, window, QWebOSWindow::handlePause)
++        IPC_MESSAGE_FORWARD(View_Resume, window, QWebOSWindow::handleResume)
++        IPC_MESSAGE_FORWARD(View_InputEvent, window, QWebOSWindow::handleInputEvent)
++        IPC_MESSAGE_FORWARD(View_TouchEvent, window, QWebOSWindow::handleTouchEvent)
++        IPC_MESSAGE_FORWARD(View_KeyEvent, window, QWebOSWindow::handleKeyEvent)
++    IPC_END_MESSAGE_MAP()
++}
++
++void QWebOSIpcClient::onDisconnected()
++{
++}
++
++QWebOSWindow* QWebOSIpcClient::platformWindowFromId(int id)
++{
++    return m_windowMap.value(id, 0);
++}
++
++void QWebOSIpcClient::addWindow(QWebOSWindow* window)
++{
++    m_windowMap[window->winId()] = window;
++}
++
++QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/webos/qwebosipcclient.h b/src/plugins/platforms/webos/qwebosipcclient.h
+new file mode 100644
+index 0000000..118e0cb
+--- /dev/null
++++ b/src/plugins/platforms/webos/qwebosipcclient.h
+@@ -0,0 +1,48 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#ifndef QWEBOSIPCCLIENT_H
++#define QWEBOSIPCCLIENT_H
++
++#include <QHash>
++#include <PIpcClient.h>
++#include <PIpcChannelListener.h>
++
++class QWebOSWindow;
++
++class QWebOSIpcClient : public PIpcClient,
++                        public PIpcChannelListener
++{
++public:
++    QWebOSIpcClient(GMainLoop *loop);
++
++    void addWindow(QWebOSWindow* window);
++
++private:
++    virtual void serverConnected(PIpcChannel* channel);
++    virtual void serverDisconnected();
++
++    virtual void onMessageReceived(const PIpcMessage& msg);
++    virtual void onDisconnected();
++
++    QWebOSWindow* platformWindowFromId(int id);
++
++private:
++    QHash<int, QWebOSWindow*> m_windowMap;
++};
++
++#endif // QWEBOSIPCCLIENT_H
+diff --git a/src/plugins/platforms/webos/qwebosnativeinterface.cpp b/src/plugins/platforms/webos/qwebosnativeinterface.cpp
+new file mode 100644
+index 0000000..cb4b80a
+--- /dev/null
++++ b/src/plugins/platforms/webos/qwebosnativeinterface.cpp
+@@ -0,0 +1,32 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#include "qwebosnativeinterface.h"
++#include "qwebosglcontext.h"
++
++#include <QtGui/private/qapplication_p.h>
++
++void* QWebOSNativeInterface::nativeResourceForWidget(const QByteArray &resourceString, QWidget *widget)
++{
++    QByteArray lowerCaseResource = resourceString.toLower();
++
++    if (lowerCaseResource == "display") {
++        return QWebOSGLContext::display();
++    }
++
++    return NULL;
++}
+diff --git a/src/plugins/platforms/webos/qwebosnativeinterface.h b/src/plugins/platforms/webos/qwebosnativeinterface.h
+new file mode 100644
+index 0000000..c2502e6
+--- /dev/null
++++ b/src/plugins/platforms/webos/qwebosnativeinterface.h
+@@ -0,0 +1,32 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++
++#ifndef QWEBOSNATIVEINTERFACE_H
++#define QWEBOSNATIVEINTERFACE_H
++
++#include <QtGui/QPlatformNativeInterface>
++
++class QWebOSNativeInterface : public QPlatformNativeInterface
++{
++public:
++    void *nativeResourceForWidget(const QByteArray &resourceString,
++				  QWidget *widget);
++};
++
++
++#endif // QWEBOSNATIVEINTERFACE_H
+diff --git a/src/plugins/platforms/webos/qwebosscreen.cpp b/src/plugins/platforms/webos/qwebosscreen.cpp
+index e87c00c..662ca45 100644
+--- a/src/plugins/platforms/webos/qwebosscreen.cpp
++++ b/src/plugins/platforms/webos/qwebosscreen.cpp
+@@ -1,5 +1,6 @@
+ /**
+  *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -14,254 +15,22 @@
+  *  limitations under the License.
+  */
+ 
+-//#include "NWindowBuffer.h"
+ #include "qwebosscreen.h"
+-
+-#include "../eglconvenience/qeglconvenience.h"
+-#include "../eglconvenience/qeglplatformcontext.h"
+-
+-#include <GLES2/gl2.h>
+-
++#include "qweboswindow.h"
+ #include <QDebug>
+-
+-#define STATUS_BAR_PADDING 28
++#include <QCoreApplication>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-    EGLDisplay* disp = NULL;
+-    void setEglSwapInterval(int interval) {
+-        //printf("Turning vsync %s\n", interval ? "on" : "off");
+-        eglSwapInterval(disp, interval);
+-    }
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-// #define QEGL_EXTRA_DEBUG
+-
+-#ifdef QEGL_EXTRA_DEBUG
+-struct AttrInfo { EGLint attr; const char *name; };
+-static struct AttrInfo attrs[] = {
+-    {EGL_BUFFER_SIZE, "EGL_BUFFER_SIZE"},
+-    {EGL_ALPHA_SIZE, "EGL_ALPHA_SIZE"},
+-    {EGL_BLUE_SIZE, "EGL_BLUE_SIZE"},
+-    {EGL_GREEN_SIZE, "EGL_GREEN_SIZE"},
+-    {EGL_RED_SIZE, "EGL_RED_SIZE"},
+-    {EGL_DEPTH_SIZE, "EGL_DEPTH_SIZE"},
+-    {EGL_STENCIL_SIZE, "EGL_STENCIL_SIZE"},
+-    {EGL_CONFIG_CAVEAT, "EGL_CONFIG_CAVEAT"},
+-    {EGL_CONFIG_ID, "EGL_CONFIG_ID"},
+-    {EGL_LEVEL, "EGL_LEVEL"},
+-    {EGL_MAX_PBUFFER_HEIGHT, "EGL_MAX_PBUFFER_HEIGHT"},
+-    {EGL_MAX_PBUFFER_PIXELS, "EGL_MAX_PBUFFER_PIXELS"},
+-    {EGL_MAX_PBUFFER_WIDTH, "EGL_MAX_PBUFFER_WIDTH"},
+-    {EGL_NATIVE_RENDERABLE, "EGL_NATIVE_RENDERABLE"},
+-    {EGL_NATIVE_VISUAL_ID, "EGL_NATIVE_VISUAL_ID"},
+-    {EGL_NATIVE_VISUAL_TYPE, "EGL_NATIVE_VISUAL_TYPE"},
+-    {EGL_SAMPLES, "EGL_SAMPLES"},
+-    {EGL_SAMPLE_BUFFERS, "EGL_SAMPLE_BUFFERS"},
+-    {EGL_SURFACE_TYPE, "EGL_SURFACE_TYPE"},
+-    {EGL_TRANSPARENT_TYPE, "EGL_TRANSPARENT_TYPE"},
+-    {EGL_TRANSPARENT_BLUE_VALUE, "EGL_TRANSPARENT_BLUE_VALUE"},
+-    {EGL_TRANSPARENT_GREEN_VALUE, "EGL_TRANSPARENT_GREEN_VALUE"},
+-    {EGL_TRANSPARENT_RED_VALUE, "EGL_TRANSPARENT_RED_VALUE"},
+-    {EGL_BIND_TO_TEXTURE_RGB, "EGL_BIND_TO_TEXTURE_RGB"},
+-    {EGL_BIND_TO_TEXTURE_RGBA, "EGL_BIND_TO_TEXTURE_RGBA"},
+-    {EGL_MIN_SWAP_INTERVAL, "EGL_MIN_SWAP_INTERVAL"},
+-    {EGL_MAX_SWAP_INTERVAL, "EGL_MAX_SWAP_INTERVAL"},
+-    {-1, 0}};
+-#endif //QEGL_EXTRA_DEBUG
+-
+-QWebOSScreen::QWebOSScreen(EGLNativeDisplayType display, bool offscreen)
+-    : m_depth(32)
+-    , m_format(QImage::Format_Invalid)
+-    , m_platformContext(0)
+-    , m_surface(0)
+-    , m_offscreen(offscreen)
+-//    , m_nrWindow(0)
+-    , m_direct(false)
++QWebOSScreen::QWebOSScreen()
++    : m_depth(32),
++      m_format(QImage::Format_Invalid),
++      m_direct(false)
+ {
+-#ifdef QEGL_EXTRA_DEBUG
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-#endif
+-
+-    EGLint major, minor;
+-#ifdef QEGL_EXTRA_DEBUG
+-    EGLint index;
+-#endif
+-    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+-        qWarning("Could not bind GL_ES API\n");
+-        qFatal("EGL error");
+-    }
+-
+-    m_dpy = eglGetDisplay(display);
+-    if (m_dpy == EGL_NO_DISPLAY) {
+-        qDebug() << "Could not open egl display\n";
+-    }
+-    qDebug() << "Opened display" << m_dpy;
+-
+-    if (!eglInitialize(m_dpy, &major, &minor)) {
+-        qDebug() << "Could not initialize egl display";
+-    }
+-
+-    qDebug("Initialized display %d %d\n", major, minor);
+-
+-    int swapInterval = 1;
+-    QByteArray swapIntervalString = qgetenv("QT_QPA_EGLFS_SWAPINTERVAL");
+-    if (!swapIntervalString.isEmpty()) {
+-        bool ok;
+-        swapInterval = swapIntervalString.toInt(&ok);
+-        if (!ok)
+-            swapInterval = 1;
+-    }
+-    eglSwapInterval(m_dpy, swapInterval);
+-
+-}
+-
+-void QWebOSScreen::createAndSetPlatformContext() const {
+-    const_cast<QWebOSScreen *>(this)->createAndSetPlatformContext();
+ }
+ 
+-void QWebOSScreen::createAndSetPlatformContext()
+-{
+-    QPlatformWindowFormat platformFormat = QPlatformWindowFormat::defaultFormat();
+-
+-    platformFormat.setWindowApi(QPlatformWindowFormat::OpenGL);
+-
+-    QByteArray depthString = qgetenv("QT_QPA_EGLFS_DEPTH");
+-    if (depthString.toInt() == 16) {
+-        platformFormat.setDepth(16);
+-        platformFormat.setRedBufferSize(5);
+-        platformFormat.setGreenBufferSize(6);
+-        platformFormat.setBlueBufferSize(5);
+-        m_depth = 16;
+-        m_format = QImage::Format_RGB16;
+-    } else {
+-        platformFormat.setDepth(32);
+-        platformFormat.setRedBufferSize(8);
+-        platformFormat.setGreenBufferSize(8);
+-        platformFormat.setBlueBufferSize(8);
+-        m_depth = 32;
+-        m_format = QImage::Format_ARGB32_Premultiplied;
+-    }
+-    if (!qgetenv("QT_QPA_EGLFS_MULTISAMPLE").isEmpty()) {
+-        platformFormat.setSampleBuffers(true);
+-    }
+-
+-    EGLConfig config = q_configFromQPlatformWindowFormat(m_dpy, platformFormat);
+-
+-    EGLNativeWindowType eglWindow = 0;
+-
+-    if(m_offscreen) 
+-    {
+-//        qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "3   ****************";
+-//        int width=0, height=0;
+-//        m_surfaceDirect = eglCreateWindowSurface(m_dpy, config, eglWindow, NULL);
+-//        if(m_surfaceDirect != EGL_NO_SURFACE)
+-//        {
+-//            eglQuerySurface(m_dpy, m_surfaceDirect, EGL_WIDTH, &width);
+-//            eglQuerySurface(m_dpy, m_surfaceDirect, EGL_HEIGHT, &height);
+-//            height -= STATUS_BAR_PADDING;
+-//        }
+-//        else
+-//        {
+-//            qFatal("failed to create direct rendering surface");
+-//            return;
+-//        }
+-
+-//        m_nrWindow = new QWebOSWindowPrivate();
+-        
+-//        m_nrWindow->Set(width, height);
+-//        unsigned int handles[1] = { 0 };
+-//        if(!m_nrWindow->AttachBuffers(1, handles)) {
+-//            qFatal("couldn't attach buffers");
+-//            return;
+-//        }
+-//        NPixmap* m_nPixmap = NPixmap::Create(width,height);
+-//        int pitch = sizeof(uint32_t) * ((width + 31) & ~31);
+-//        m_nrWindow->SetBuffer(0, NPixmap::Attach(0, width, height, pitch));
+-//        m_nrWindow->setEglDisplay(m_dpy);
+-
+-//        m_surface = eglCreateWindowSurface(m_dpy, config, m_nrWindow, NULL);
+-    }
+-    else
+-    {
+-        m_surface = eglCreateWindowSurface(m_dpy, config, eglWindow, NULL);
+-    }
+-
+-    if (m_surface == EGL_NO_SURFACE) {
+-        qDebug("Could not create the egl surface: error = 0x%x\n", eglGetError());
+-        eglTerminate(m_dpy);
+-        qFatal("EGL error");
+-    }
+-
+-    qWarning("5. Created surface");
+-
+-#ifdef QEGL_EXTRA_DEBUG
+-    qWarning("Configuration %d matches requirements\n", (int)config);
+-
+-    for (index = 0; attrs[index].attr != -1; ++index) {
+-        EGLint value;
+-        if (eglGetConfigAttrib(m_dpy, config, attrs[index].attr, &value)) {
+-            qWarning("\t%s: %d\n", attrs[index].name, (int)value);
+-        }
+-    }
+-    qWarning("\n");
+-#endif
+-
+-    EGLint temp;
+-    EGLint attribList[32];
+-
+-    temp = 0;
+-
+-    attribList[temp++] = EGL_CONTEXT_CLIENT_VERSION;
+-    attribList[temp++] = 2; // GLES version 2
+-    attribList[temp++] = EGL_NONE;
+-    
+-
+-    //start me in offscreen mode
+-    m_platformContext = new QEGLPlatformContext(m_dpy,config,attribList,m_surface,EGL_OPENGL_ES_API);
+-
+-    EGLint w,h;                    // screen size detection
+-    eglQuerySurface(m_dpy, m_surface, EGL_WIDTH, &w);
+-    eglQuerySurface(m_dpy, m_surface, EGL_HEIGHT, &h);
+-    
+-    m_geometry = QRect(0,0,w,h);
+-
+-    glClearColor(0.7f, 0.7f, 0.7f, 1.0f);
+-
+-}
+-
+-//void QWebOSScreen::directRendering(bool enable)
+-//{
+-//    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-//    if(enable)
+-//    {
+-//        if(m_direct != enable) {
+-//            glClearColor(0,0,0,0);
+-//            glClear(GL_COLOR_BUFFER_BIT);
+-//        }
+-//        m_platformContext->doneCurrent();
+-//        m_platformContext->setSurface(m_surfaceDirect);
+-//        m_platformContext->makeCurrent();
+-//    }
+-//    else
+-//    {
+-//        m_platformContext->setSurface(m_surface);
+-//        m_platformContext->makeCurrent();
+-//    }
+-//    m_direct = enable;
+-//}
+-
+ QRect QWebOSScreen::geometry() const
+ {
+-    //qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "Geometry" << m_geometry <<"****************";
+-    if (m_geometry.isNull()) {
+-        createAndSetPlatformContext();
+-    }
+     return m_geometry;
+ }
+ 
+@@ -272,18 +41,7 @@ int QWebOSScreen::depth() const
+ 
+ QImage::Format QWebOSScreen::format() const
+ {
+-    if (m_format == QImage::Format_Invalid)
+-        createAndSetPlatformContext();
+     return m_format;
+ }
+-QPlatformGLContext *QWebOSScreen::platformContext() const
+-{
+-    if (!m_platformContext) {
+-        QWebOSScreen *that = const_cast<QWebOSScreen *>(this);
+-        that->createAndSetPlatformContext();
+-    }
+-
+-    return m_platformContext;
+-}
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/webos/qwebosscreen.h b/src/plugins/platforms/webos/qwebosscreen.h
+index c2fdd2f..b599161 100644
+--- a/src/plugins/platforms/webos/qwebosscreen.h
++++ b/src/plugins/platforms/webos/qwebosscreen.h
+@@ -1,48 +1,49 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
+ 
+ #ifndef QWEBOSSCREEN_H
+ #define QWEBOSSCREEN_H
+ 
+ #include <QPlatformScreen>
+-
+ #include <QtCore/QTextStream>
+-
+-#include <EGL/egl.h>
+-
++#include <QHash>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ class QPlatformGLContext;
+ class QEGLPlatformContext;
+-//struct QWebOSWindowPrivate;
+ 
+ class QWebOSScreen : public QPlatformScreen
+ {
+ public:
+-    QWebOSScreen(EGLNativeDisplayType display, bool offscreen);
++    QWebOSScreen();
+     ~QWebOSScreen() {}
+ 
+     QRect geometry() const;
+     int depth() const;
+     QImage::Format format() const;
+ 
+-    QPlatformGLContext *platformContext() const;
+-
+-//    QWebOSWindowPrivate* remoteWindow() const { return m_nrWindow; }
+     void directRendering(bool enable);
+     bool isDirectRendering() { return m_direct; }
+-private:
+-    void createAndSetPlatformContext() const;
+-    void createAndSetPlatformContext();
+ 
++private:
+     QRect m_geometry;
+     int m_depth;
+     QImage::Format m_format;
+-    QEGLPlatformContext *m_platformContext;
+-    EGLDisplay m_dpy;
+-    EGLSurface m_surface;
+-    EGLSurface m_surfaceDirect;
+-    bool m_offscreen;
+-//    QWebOSWindowPrivate* m_nrWindow;
+     bool m_direct;
+ };
+ 
+diff --git a/src/plugins/platforms/webos/qweboswindow.cpp b/src/plugins/platforms/webos/qweboswindow.cpp
+index dccb896..5534561 100644
+--- a/src/plugins/platforms/webos/qweboswindow.cpp
++++ b/src/plugins/platforms/webos/qweboswindow.cpp
+@@ -1,5 +1,6 @@
+ /**
+  *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -14,27 +15,44 @@
+  *  limitations under the License.
+  */
+ 
+-#include "qweboswindow.h"
+-
+ #include <QtGui/QWindowSystemInterface>
+ #include <QApplication>
+-QT_BEGIN_NAMESPACE
++#include <QSystemSemaphore>
++#include <QElapsedTimer>
++#include <QDebug>
+ 
+-QWebOSWindow::QWebOSWindow(QWidget *w, QWebOSScreen *screen)
+-    : QPlatformWindow(w), m_screen(screen)
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    static int serialNo = 0;
+-    m_winid  = ++serialNo;
++#include "qweboswindow.h"
++#include "qwebosscreen.h"
++#include "qwebosglcontext.h"
++#include "hybriscompositorclient.h"
++
++#define MESSAGES_INTERNAL_FILE "SysMgrMessagesInternal.h"
++#include <PIpcMessageMacros.h>
++#include <PIpcChannel.h>
++
++#include "qwebosipcclient.h"
++
++QT_BEGIN_NAMESPACE
+ 
+-    qWarning("QEglWindow %p: %p %p 0x%x\n", this, w, screen, uint(m_winid));
++#define Q_WEBOS_DEBUG 1
+ 
++QWebOSWindow::QWebOSWindow(QWebOSIpcClient *ipcClient, HybrisCompositorClient *client, QWidget *widget, QWebOSScreen *screen)
++    : QPlatformWindow(widget),
++      OffscreenNativeWindow(widget->width(), widget->height()),
++      m_screen(screen),
++      m_glcontext(0),
++      m_client(client),
++      m_ipcClient(ipcClient),
++      m_winid(-1),
++      m_isWebAppMgr(false)
++{
++    qDebug() << __PRETTY_FUNCTION__;
++    m_isWebAppMgr = (::getenv("QT_WEBOS_WEBAPPMGR") != 0);
++    qDebug() << __PRETTY_FUNCTION__ << "2";
+ }
+ 
+-void QWebOSWindow::setGeometry(const QRect &)
++void QWebOSWindow::setGeometry(const QRect& rect)
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    QRect rect(m_screen->availableGeometry());
+     QWindowSystemInterface::handleGeometryChange(this->widget(), rect);
+ 
+     // Since toplevels are fullscreen, propegate the screen size back to the widget
+@@ -45,23 +63,198 @@ void QWebOSWindow::setGeometry(const QRect &)
+ 
+ WId QWebOSWindow::winId() const
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+     return m_winid;
+ }
+ 
+ QPlatformGLContext *QWebOSWindow::glContext() const
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
++    if (!m_glcontext)
++        const_cast<QWebOSWindow*>(this)->createGLContext();
++
++    return m_glcontext;
++}
++
++void QWebOSWindow::createGLContext()
++{
++    QPlatformWindowFormat format = widget()->platformWindowFormat();
++
++    if (m_glcontext == 0 && format.windowApi() == QPlatformWindowFormat::OpenGL)
++        m_glcontext = new QWebOSGLContext( const_cast<QWebOSWindow*>(this) );
++}
++
++void QWebOSWindow::postBuffer(OffscreenNativeWindowBuffer *buffer)
++{
++    // Only post buffer when we have assigned a valid window id as otherwise
++    // the compositor can't associate the buffer with any active window
++    if (m_winid != -1)
++        m_client->postBuffer(m_winid, buffer);
++}
++
++void QWebOSWindow::handleFocus(bool focused)
++{
++    if (focused)
++        QWindowSystemInterface::handleWindowActivated(widget());
++    else
++        QWindowSystemInterface::handleWindowActivated(0);
++}
++
++void QWebOSWindow::handleResize(int width, int height, bool resizeBuffer)
++{
++    qDebug() << __PRETTY_FUNCTION__ << "width =" << width << "height =" << height;
++    Q_UNUSED(resizeBuffer)
++    setGeometry(QRect(0, 0, width, height));
++}
++
++void QWebOSWindow::handleFullScreenEnabled()
++{
++}
+ 
+-    Q_ASSERT(m_screen);
+-    if (m_screen)
++void QWebOSWindow::handleFullScreenDisabled()
++{
++}
++
++void QWebOSWindow::handlePause()
++{
++}
++
++void QWebOSWindow::handleResume()
++{
++}
++
++void QWebOSWindow::handleInputEvent(const SysMgrEventWrapper& wrapper)
++{
++    SysMgrEvent* e = wrapper.event;
++    QPoint mousePos;
++
++    switch(e->type)
+     {
+-        qDebug() << "++++++++++++++++++++QEglWindow::glContext +++++++++++++++++++++++++++++++++" ;
+-        return m_screen->platformContext();
++        case SysMgrEvent::Accelerometer:
++            break;
++        case SysMgrEvent::PenFlick:
++            mousePos = QPoint(e->x, e->y);
++            QWindowSystemInterface::handleWheelEvent(widget(),mousePos,mousePos,e->z,Qt::Vertical);
++            break;
++        case SysMgrEvent::PenPressAndHold:
++            mousePos = QPoint(e->x, e->y);
++            QWindowSystemInterface::handleMouseEvent(widget(), mousePos, mousePos, Qt::NoButton);
++            break;
++        case SysMgrEvent::PenDown:
++            mousePos = QPoint(e->x, e->y);
++            QWindowSystemInterface::handleMouseEvent(widget(), mousePos, mousePos, Qt::LeftButton);
++            break;
++        case SysMgrEvent::PenUp:
++            mousePos = QPoint(e->x, e->y);
++            QWindowSystemInterface::handleMouseEvent(widget(), mousePos, mousePos, Qt::NoButton);
++            break;
++        case SysMgrEvent::PenMove:
++            mousePos = QPoint(e->x, e->y);
++            QWindowSystemInterface::handleMouseEvent(widget(), mousePos, mousePos, Qt::LeftButton);
++            break;
++        case SysMgrEvent::GestureStart:
++            break;
++        case SysMgrEvent::GestureEnd:
++            break;
++        case SysMgrEvent::GestureCancel:
++            break;
++        default:
++            break;
++    }
++}
++
++void QWebOSWindow::handleTouchEvent(const SysMgrTouchEvent& touchEvent)
++{
++    QEvent::Type type = QEvent::None;
++
++    QList<QWindowSystemInterface::TouchPoint> touchPoints;
++    for (unsigned int i = 0; i < touchEvent.numTouchPoints; i++) {
++        QWindowSystemInterface::TouchPoint touchPoint;
++        QPoint pt(touchEvent.touchPoints[i].x, touchEvent.touchPoints[i].y);
++
++        // get size of screen which contains window
++        QPlatformScreen *platformScreen = QPlatformScreen::platformScreenForWidget(widget());
++        QSizeF screenSize = platformScreen->physicalSize();
++
++        touchPoint.id = touchEvent.touchPoints[i].id;
++
++        // update cached position of current touch point
++        touchPoint.normalPosition = QPointF( static_cast<qreal>(pt.x()) / screenSize.width(), static_cast<qreal>(pt.y()) / screenSize.height() );
++        touchPoint.area = QRectF( pt.x(), pt.y(), 0.0, 0.0 );
++        touchPoint.pressure = 1;
++
++        touchPoint.state = static_cast<Qt::TouchPointState>(touchEvent.touchPoints[i].state);
++
++        // FIXME: what if the touchpoints have different states? does this ever happen?
++        switch (touchPoint.state) {
++            case Qt::TouchPointPressed:
++                type = QEvent::TouchBegin;
++                break;
++            case Qt::TouchPointMoved:
++                type = QEvent::TouchUpdate;
++                break;
++            case Qt::TouchPointReleased:
++                type = QEvent::TouchEnd;
++                break;
++        }
++
++        touchPoints.append(touchPoint);
++
++        QWindowSystemInterface::handleMouseEvent(widget(), pt, pt, (touchPoint.state != Qt::TouchPointReleased ? Qt::LeftButton : Qt::NoButton));
++    }
++
++    QWindowSystemInterface::handleTouchEvent(widget(), type, QTouchEvent::TouchScreen, touchPoints);
++}
++
++void QWebOSWindow::handleKeyEvent(const SysMgrKeyEvent& keyEvent)
++{
++    QKeyEvent ev = keyEvent.qtEvent();
++    Qt::Key key;
++    if (ev.key() == 0x01200001)
++        key = Qt::Key_Backspace;
++    else
++        key = (Qt::Key)ev.key();
++    QWindowSystemInterface::handleKeyEvent(widget(), ev.type(), key, ev.modifiers(), ev.text(), 0, 0);
++}
++
++PIpcChannel* QWebOSWindow::channel() const
++{
++    return m_ipcClient->channel();
++}
++
++void QWebOSWindow::setVisible(bool visible)
++{
++    qDebug() << __PRETTY_FUNCTION__;
++
++    if (!m_isWebAppMgr) {
++        if(!channel()) {
++            qWarning() << "not connected to window manager...";
++            return;
++        }
++        
++        if (visible) {
++            QSize size = geometry().size();
++            channel()->sendSyncMessage(new ViewHost_PrepareAddWindow((1 << 1),
++                size.width(), size.height(), &m_winid));
++            
++            m_ipcClient->addWindow(this);
++            
++            std::string winProps = "{ "
++                    " 'fullScreen': false, " // defaults to false
++                    " 'overlayNotificationsPosition': 'bottom', " // options are left, right, top, bottom
++                    " 'subtleLightbar': true, " // defaults to false
++                    " 'blockScreenTimeout': true, " // defaults to false
++                    " 'fastAccelerometer': true, " // defaults to false
++                    " 'suppressBannerMessages': false, " // defaults to false
++                    " 'hasPauseUi': true " // defaults to false
++                    " }";
++            channel()->sendAsyncMessage(new ViewHost_SetWindowProperties(winId(), winProps));
++            channel()->sendAsyncMessage(new ViewHost_AddWindow(winId()));
++            channel()->sendAsyncMessage(new ViewHost_FocusWindow(winId()));
++            
++            setGeometry(QRect(QPoint(), size));
++        }
+     }
+ 
+-    qDebug() << "++++++++++++++++++++QEglWindow::glContext : NOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO+++++++++++++++++++++++++++++++++" ;
+-    return 0;
++    QPlatformWindow::setVisible(visible);
+ }
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/webos/qweboswindow.h b/src/plugins/platforms/webos/qweboswindow.h
+index cab7b02..502d822 100644
+--- a/src/plugins/platforms/webos/qweboswindow.h
++++ b/src/plugins/platforms/webos/qweboswindow.h
+@@ -1,28 +1,84 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
+ 
+ #ifndef QWEBOSWINDOW_H
+ #define QWEBOSWINDOW_H
+ 
+-#include "qwebosintegration.h"
+-#include "qwebosscreen.h"
+-
+ #include <QPlatformWindow>
+ #include <QtGui/QWidget>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QWebOSWindow : public QPlatformWindow
++#include <EGL/eglhybris.h>
++
++#include <SysMgrEvent.h>
++#include <SysMgrDefs.h>
++#include <SysMgrKeyEventTraits.h>
++#include <SysMgrTouchEventTraits.h>
++
++typedef WId QWebOSWindowId;
++
++class HybrisCompositorClient;
++class QWebOSScreen;
++class QWebOSGLContext;
++class QSystemSemaphore;
++class PIpcChannel;
++class QWebOSIpcClient;
++
++class QWebOSWindow : public QPlatformWindow,
++                     public OffscreenNativeWindow
+ {
+ public:
+-    QWebOSWindow(QWidget *w, QWebOSScreen *screen);
++    QWebOSWindow(QWebOSIpcClient *ipcClient, HybrisCompositorClient *client, QWidget *w, QWebOSScreen *screen);
+ 
+-    void setGeometry(const QRect &);
++    virtual void setGeometry(const QRect &);
+     WId winId() const;
+ 
++    void setWinId(int winId) { m_winid = winId; }
++
+     QPlatformGLContext *glContext() const;
++    void setVisible(bool visible);
++
++    virtual void postBuffer(OffscreenNativeWindowBuffer *buffer);
++
++    void createGLContext();
++
++public:
++    void handleFocus(bool focused);
++    void handleResize(int width, int height, bool resizeBuffer);
++    void handleFullScreenEnabled();
++    void handleFullScreenDisabled();
++    void handlePause();
++    void handleResume();
++    void handleInputEvent(const SysMgrEventWrapper& wrapper);
++    void handleTouchEvent(const SysMgrTouchEvent& touchEvent);
++    void handleKeyEvent(const SysMgrKeyEvent& keyEvent);
++    void handleBufferConsumed(int key);
++    PIpcChannel* channel() const; // Required by IPC_MESSAGE_FORWARD
+ 
+ private:
+     QWebOSScreen *m_screen;
++    QWebOSGLContext *m_glcontext;
+     WId m_winid;
++    HybrisCompositorClient *m_client;
++    QWebOSIpcClient *m_ipcClient;
++    bool m_isWebAppMgr;
+ };
++
+ QT_END_NAMESPACE
++
+ #endif // QWEBOSWINDOW_H
+diff --git a/src/plugins/platforms/webos/qweboswindowsurface.cpp b/src/plugins/platforms/webos/qweboswindowsurface.cpp
+index 686751f..ca66230 100644
+--- a/src/plugins/platforms/webos/qweboswindowsurface.cpp
++++ b/src/plugins/platforms/webos/qweboswindowsurface.cpp
+@@ -1,5 +1,6 @@
+ /**
+  *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -14,6 +15,9 @@
+  *  limitations under the License.
+  */
+ 
++#include "qwebosintegration.h"
++#include "qweboswindow.h"
++#include "qwebosglcontext.h"
+ #include "qweboswindowsurface.h"
+ 
+ #include <QtGui/QPlatformGLContext>
+@@ -29,56 +33,44 @@ QT_BEGIN_NAMESPACE
+ class QWebOSPaintDevice : public QGLPaintDevice
+ {
+ public:
+-    QWebOSPaintDevice(QWebOSScreen *screen, QWidget *widget)
+-        :QGLPaintDevice(), m_screen(screen)
++    QWebOSPaintDevice(QWebOSGLContext* platformGLContext)
++        : m_platformGLContext(platformGLContext)
+     {
+-    #ifdef QEGL_EXTRA_DEBUG
+-        qWarning("QEglPaintDevice %p, %p, %p",this, screen, widget);
+-    #else
+-        Q_UNUSED(widget)
+-    #endif
++        qDebug()<<__PRETTY_FUNCTION__;
++        m_context = QGLContext::fromPlatformGLContext(m_platformGLContext);
+     }
+ 
+-    QSize size() const { return m_screen->geometry().size(); }
+-    QGLContext* context() const { return QGLContext::fromPlatformGLContext(m_screen->platformContext());}
++    QSize size() const {
++        qDebug()<<__PRETTY_FUNCTION__;
++        return m_platformGLContext->surfaceSize();
++    }
++
++    QGLContext* context() const {
++        qDebug()<<__PRETTY_FUNCTION__;
++        return m_context;
++    }
+ 
+     QPaintEngine *paintEngine() const {
++        qDebug()<<__PRETTY_FUNCTION__;
+         return qt_qgl_paint_engine();
+     }
+ 
+-    void  beginPaint(){
+-        QGLPaintDevice::beginPaint();
+-    }
+ private:
+-    QWebOSScreen *m_screen;
++    QWebOSGLContext* m_platformGLContext;
+     QGLContext *m_context;
+ };
+ 
+-
+-//void QWebOSWindowSurface::slotSwapBuffers()
+-//{
+-//    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-//    if (m_channel && !(m_screen->isDirectRendering())) {
+-//        m_channel->sendAsyncMessage(new ViewHost_UpdateFullWindow(routingId()));
+-//    }
+-//}
+-
+-QWebOSWindowSurface::QWebOSWindowSurface(QWebOSScreen *screen, QWidget *window, GMainLoop* loop)
++QWebOSGLWindowSurface::QWebOSGLWindowSurface(QWebOSScreen *screen, QWidget *window)
+     : QWindowSurface(window)
+ {
+-#ifdef QEGL_EXTRA_DEBUG
+-    qWarning("QEglWindowSurface %p, %p", window, screen);
+-#endif
+-    m_paintDevice = new QWebOSPaintDevice(screen, window);
+-    m_screen = screen;
+-    //connect((QEGLPlatformContext*)(window->platformWindow()->glContext()), SIGNAL(signalSwapBuffers()), SLOT(slotSwapBuffers()));
++    qDebug() << __PRETTY_FUNCTION__;
+ 
+-//    QWebOSWindowEvents* filter = new QWebOSWindowEvents;
+-//    connect(filter, SIGNAL(signalInputFocusChanged(bool,QObject*)), SLOT(slotInputFocusChanged(bool,QObject*)));
+-//    window->installEventFilter(filter);
++    m_platformGLContext = static_cast<QWebOSGLContext*>(window->platformWindow()->glContext());
++    m_paintDevice = new QWebOSPaintDevice(m_platformGLContext);
++    m_screen = screen;
+ }
+ 
+-void QWebOSWindowSurface::flush(QWidget *widget, const QRegion &region, const QPoint &offset)
++void QWebOSGLWindowSurface::flush(QWidget *widget, const QRegion &region, const QPoint &offset)
+ {
+     Q_UNUSED(region);
+     Q_UNUSED(offset);
+@@ -86,245 +78,28 @@ void QWebOSWindowSurface::flush(QWidget *widget, const QRegion &region, const QP
+     // QGraphicsView contains a QWidget for its frame, even if it is not visible. Any repaint
+     // on that frame widget will cause an extra buffer swap, causing problems. This filters out
+     // that swap.
+-    if(qobject_cast<QGraphicsView*>(widget))
+-        return;
++//    if(qobject_cast<QGraphicsView*>(widget))
++//        return;
+     widget->platformWindow()->glContext()->swapBuffers();
+ }
+ 
+-//void QWebOSWindowSurface::slotInputFocusChanged(bool focus, QObject* obj)
+-//{
+-//    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+ 
+-//    if (m_channel) {
+-//        PalmIME::EditorState state;
+-//        if(QWidget* widget = qobject_cast<QWidget*>(obj))
+-//        {
+-//            Qt::InputMethodHints hints = widget->inputMethodHints();
+-//            if((hints & Qt::ImhUrlCharactersOnly) == Qt::ImhUrlCharactersOnly)
+-//                state = PalmIME::EditorState(PalmIME::FieldType_URL);
+-//            else if((hints & Qt::ImhEmailCharactersOnly) == Qt::ImhEmailCharactersOnly)
+-//                state = PalmIME::EditorState(PalmIME::FieldType_Email);
+-//            else if((hints & Qt::ImhDialableCharactersOnly) == Qt::ImhDialableCharactersOnly)
+-//                state = PalmIME::EditorState(PalmIME::FieldType_Phone);
+-//        }
+-//        m_channel->sendAsyncMessage(new ViewHost_EditorFocusChanged(routingId(), focus, state));
+-//    }
+-//}
+-
+-QWebOSWindowSurface::~QWebOSWindowSurface()
++QWebOSGLWindowSurface::~QWebOSGLWindowSurface()
+ {
+ }
+ 
+-void QWebOSWindowSurface::resize(const QSize &size)
++void QWebOSGLWindowSurface::resize(const QSize &size)
+ {
+     Q_UNUSED(size);
+ }
+-
+-#if 0
+-int QWebOSWindowSurface::routingId() const
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    if (m_nrWindow)
+-        return m_nrWindow->GetBuffer(0)->Handle();
+-    return 0;
+-}
+-
+-void QWebOSWindowSurface::onDisconnected()
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    qWarning("%s", __PRETTY_FUNCTION__);
+-    exit(-1);
+-}
+-
+-void QWebOSWindowSurface::serverConnected(PIpcChannel* channel)
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    channel->setListener(this);
+-
+-    m_nrWindow = m_screen->remoteWindow();
+-
+-    setChannel(channel);
+-
+-    QRect r = window()->platformWindow()->geometry();
+-    m_channel->sendAsyncMessage(new ViewHost_PrepareAddWindow(routingId(), 8, r.width(), r.height()));
+-
+-    std::string winProps = "{ "
+-                           "  'fullScreen': false, "                     // defaults to false
+-                           "  'overlayNotificationsPosition': 'bottom', " // options are left, right, top, bottom
+-                           "  'subtleLightbar': true, "                 // defaults to false
+-                           "  'blockScreenTimeout': true, "             // defaults to false
+-                           "  'fastAccelerometer': true, "              // defaults to false
+-                           "  'suppressBannerMessages': false, "        // defaults to false
+-                           "  'hasPauseUi': true "                     // defaults to false
+-                           " }";
+-    m_channel->sendAsyncMessage(new ViewHost_SetWindowProperties(routingId(), winProps));
+-
+-    m_channel->sendAsyncMessage(new ViewHost_AddWindow(routingId()));
+-}
+-
+-void QWebOSWindowSurface::serverDisconnected()
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    qWarning("%s", __PRETTY_FUNCTION__);
+-    exit(-1);
+-}
+-
+-
+-//Message handling
+-void QWebOSWindowSurface::onMessageReceived(const PIpcMessage& msg)
+-{
+-    bool msgIsOk;
+-
+-    IPC_BEGIN_MESSAGE_MAP(QWebOSWindowSurface, msg, msgIsOk)
+-        IPC_MESSAGE_HANDLER(View_InputEvent, onInputEvent)
+-        IPC_MESSAGE_HANDLER(View_KeyEvent, onKeyEvent)
+-        IPC_MESSAGE_HANDLER(View_TouchEvent, onTouchEvent)
+-        IPC_MESSAGE_HANDLER(View_RemoveInputFocus, onRemoveInputFocus)
+-        IPC_MESSAGE_HANDLER(View_FullScreenEnabled, onFullScreenEnabled)
+-        IPC_MESSAGE_HANDLER(View_FullScreenDisabled, onFullScreenDisabled)
+-        IPC_MESSAGE_HANDLER(View_CommitText, onCommitText)
+-    IPC_END_MESSAGE_MAP()
+-}
+-
+-void QWebOSWindowSurface::onCommitText(std::string s)
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    QWidget* focus = QApplication::focusWidget();
+-    if(focus)
+-    {
+-        QString str(s.c_str());
+-        for(QString::iterator iter = str.begin(); iter != str.end(); iter++)
+-        {
+-            QWindowSystemInterface::handleKeyEvent(window(), QEvent::KeyPress, 0, 0, *iter);
+-            QWindowSystemInterface::handleKeyEvent(window(), QEvent::KeyRelease, 0, 0, *iter);
+-        }
+-    }
+-}
+-
+-void QWebOSWindowSurface::onRemoveInputFocus()
++void QWebOSGLWindowSurface::beginPaint(const QRegion &region)
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    qApp->postEvent(window(), new QEvent(QEvent::CloseSoftwareInputPanel));
+-}
+-
+-void QWebOSWindowSurface::onFullScreenEnabled()
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    qWarning("Full screen enabled");
+-    m_screen->directRendering(true);
+-    window()->update();
+-}
+-void QWebOSWindowSurface::onFullScreenDisabled()
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    qWarning("Full screen disabled");
+-    m_screen->directRendering(false);
+-    window()->update();
+-}
+-
+-void QWebOSWindowSurface::onKeyEvent(const SysMgrKeyEvent& e)
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    QKeyEvent key = e.qtEvent();
+-    QWindowSystemInterface::handleKeyEvent(window(), key.type(), key.key(), key.modifiers(), key.text());
++    Q_UNUSED(region);
+ }
+ 
+-void QWebOSWindowSurface::onTouchEvent(const SysMgrTouchEvent& te)
++void QWebOSGLWindowSurface::endPaint(const QRegion &region)
+ {
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    QList<QWindowSystemInterface::TouchPoint> touchPoints;
+-    for (int i = 0; i < te.numTouchPoints; i++) {
+-
+-        QWindowSystemInterface::TouchPoint touchPoint;
+-        QPoint pt(te.touchPoints[i].x, te.touchPoints[i].y);
+-        QRect rc = window()->platformWindow()->geometry();
+-
+-        touchPoint.id = te.touchPoints[i].id;
+-        touchPoint.isPrimary = te.touchPoints[i].isPrimary;
+-        touchPoint.normalPosition = QPointF((qreal)pt.x() / (qreal)rc.width(), (qreal)pt.y() / (qreal)rc.height());
+-        touchPoint.area = QRectF(pt, QSize(1,1));
+-        touchPoint.pressure = 1;
+-        touchPoint.state = static_cast<Qt::TouchPointState>(te.touchPoints[i].state);
+-
+-        if (touchPoint.isPrimary) {
+-
+-            QWindowSystemInterface::handleMouseEvent(window(), pt, pt, (touchPoint.state != Qt::TouchPointReleased ? Qt::LeftButton : Qt::NoButton));
+-        }
+-
+-        touchPoints.append(touchPoint);
+-    }
+-
+-    QWindowSystemInterface::handleTouchEvent(window(), static_cast<QEvent::Type>(te.type), QTouchEvent::TouchScreen, touchPoints);
++    Q_UNUSED(region);
+ }
+ 
+-void QWebOSWindowSurface::onInputEvent(const SysMgrEventWrapper& wrapper) 
+-{
+-    qDebug() << "\t\t\t\t\**************"<< __PRETTY_FUNCTION__ << "****************";
+-    SysMgrEvent* e = wrapper.event;
+-    QPoint mousePos;
+-    switch(e->type) 
+-    {
+-        case SysMgrEvent::Accelerometer:
+-            m_trans.reset();
+-            switch(e->orientation) 
+-            {
+-                case SysMgrEvent::Orientation_Up:
+-                    m_trans.rotate(0);
+-                    break;
+-                case SysMgrEvent::Orientation_Down:
+-                    m_trans.rotate(180);
+-                    break;
+-                case SysMgrEvent::Orientation_Left:
+-                    m_trans.rotate(90);
+-                    break;
+-                case SysMgrEvent::Orientation_Right:
+-                    m_trans.rotate(270);
+-                    break;
+-                default:
+-                    //qWarning("Unhandled orientation");
+-                    break;
+-            }
+-            break;
+-        case SysMgrEvent::PenDown:
+-#ifdef DEBUG_INPUT
+-            printf("Pen Down\n");
+-#endif
+-            mousePos = QPoint(e->x, e->y);
+-            QWindowSystemInterface::handleMouseEvent(window(), mousePos, mousePos, Qt::LeftButton);
+-            break;
+-        case SysMgrEvent::PenUp:
+-#ifdef DEBUG_INPUT
+-            printf("Pen Up\n");
+-#endif
+-            mousePos = QPoint(e->x, e->y);
+-            QWindowSystemInterface::handleMouseEvent(window(), mousePos, mousePos, Qt::NoButton);
+-            break;
+-        case SysMgrEvent::PenMove:
+-#ifdef DEBUG_INPUT
+-            printf("Pen Move\n");
+-#endif
+-            mousePos = QPoint(e->x, e->y);
+-            QWindowSystemInterface::handleMouseEvent(window(), mousePos, mousePos, Qt::LeftButton);
+-            break;
+-        case SysMgrEvent::GestureStart:
+-#ifdef DEBUG_INPUT
+-            printf("Gesture start\n");
+-#endif
+-            break;
+-        case SysMgrEvent::GestureEnd:
+-#ifdef DEBUG_INPUT
+-            printf("Gesture end\n");
+-#endif
+-            break;
+-        case SysMgrEvent::GestureCancel:
+-#ifdef DEBUG_INPUT
+-            printf("Gesture cancel\n");
+-#endif
+-            break;
+-        default:
+-            printf("Unhandled event type\n");
+-            break;
+-    }
+-}
+-#endif
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/webos/qweboswindowsurface.h b/src/plugins/platforms/webos/qweboswindowsurface.h
+index efc79eb..74402a0 100644
+--- a/src/plugins/platforms/webos/qweboswindowsurface.h
++++ b/src/plugins/platforms/webos/qweboswindowsurface.h
+@@ -1,45 +1,55 @@
++/**
++ *  Copyright (c) 2012 Hewlett-Packard Development Company, L.P.
++ *                2013 Simon Busch <morphis@gravedo.de>
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#ifndef QWEBOSGLWINDOWSURFACE_H
++#define QWEBOSGLWINDOWSURFACE_H
+ 
+-#ifndef QWEBOSWINDOWSURFACE_H
+-#define QWEBOSWINDOWSURFACE_H
+-
+-#include "qwebosintegration.h"
+-#include "qweboswindow.h"
+-#include "qeglplatformcontext.h"
+ 
+ #include <QtGui/private/qwindowsurface_p.h>
+ #include "glib.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class PIpcChannel;
+-struct QWebOSWindowPrivate;
+-
+-class QWebOSWindowSurface : public QObject,
++class QWebOSWindow;
++class QWebOSGLContext;
++class QWebOSScreen;
++class QWebOSGLWindowSurface : public QObject,
+                             public QWindowSurface
+ {
+     Q_OBJECT
+ 
+ public:
+-    QWebOSWindowSurface(QWebOSScreen *screen, QWidget *window, GMainLoop* loop);
+-    virtual ~QWebOSWindowSurface();
++    QWebOSGLWindowSurface(QWebOSScreen *screen, QWidget *window);
++    virtual ~QWebOSGLWindowSurface();
+ 
+     QPaintDevice *paintDevice() { return m_paintDevice; }
+     void flush(QWidget *widget, const QRegion &region, const QPoint &offset);
+     void resize(const QSize &size);
++    virtual void beginPaint(const QRegion &region);
++    virtual void endPaint(const QRegion &region);
+ 
+ private:
+ 
+     QPaintDevice *m_paintDevice;
+-    QWebOSWindowPrivate* m_nrWindow;
+     QWebOSScreen* m_screen;
+     QTransform m_trans;
+-
+-private Q_SLOTS:
+-    void slotSwapBuffers();
+-    void slotInputFocusChanged(bool, QObject*);
+-
++    QWebOSGLContext* m_platformGLContext;
+ };
+ 
+ QT_END_NAMESPACE
+ 
+-#endif // QWEBOSWINDOWSURFACE_H
++#endif // QWebOSGLWindowSurface_H
+diff --git a/src/plugins/platforms/webos/webos.pro b/src/plugins/platforms/webos/webos.pro
+index 914d1b5..a8a32aa 100644
+--- a/src/plugins/platforms/webos/webos.pro
++++ b/src/plugins/platforms/webos/webos.pro
+@@ -11,7 +11,7 @@ INCLUDEPATH += $$QT_SOURCE_TREE/src/3rdparty/harfbuzz/src
+ DEFINES += QT_NO_FONTCONFIG
+ 
+ CONFIG += link_pkgconfig
+-PKGCONFIG += glib-2.0 freetype2
++PKGCONFIG += glib-2.0 freetype2 LunaSysMgrIpc
+ 
+ SOURCES =   main.cpp \
+             qwebosintegration.cpp \
+@@ -20,10 +20,11 @@ SOURCES =   main.cpp \
+             qwebosscreen.cpp \
+             ../eglconvenience/qeglconvenience.cpp \
+             ../eglconvenience/qeglplatformcontext.cpp \
+-            qwebosfontdatabase.cpp
+-#            qeglplatformcontext.cpp \
+-#            qweboswindowevents.cpp \
+-#            qwebosstyle.cpp
++            qwebosfontdatabase.cpp \
++            qwebosglcontext.cpp \
++            qwebosnativeinterface.cpp \
++            hybriscompositorclient.cpp \
++            qwebosipcclient.cpp
+ 
+ HEADERS =   qwebosintegration.h \
+             qweboswindow.h \
+@@ -32,10 +33,10 @@ HEADERS =   qwebosintegration.h \
+             qwebosfontdatabase.h \
+             ../eglconvenience/qeglconvenience.h \
+             ../eglconvenience/qeglplatformcontext.h \
+-#            qeglplatformcontext.h \
+-#            qweboswindow_p.h \
+-#            qweboswindowevents.h \
+-#            qwebosstyle.h
++            qwebosglcontext.h \
++            qwebosnativeinterface.h \
++            hybriscompositorclient.h \
++            qwebosipcclient.h
+ 
+ # webOS clipboard
+ INCLUDEPATH += ../clipboards
+@@ -49,11 +50,8 @@ INCLUDEPATH += $$QT_BUILD_TREE/include/QtGui
+ INCLUDEPATH += $$QT_BUILD_TREE/include/QtCore
+ SOURCES += $$QT_SOURCE_TREE/src/gui/text/qfontengine_ft.cpp
+ 
+-INCLUDEPATH += $$(STAGING_INCDIR)/napp \
+-               $$(STAGING_INCDIR)/sysmgr-ipc \
+-               $$(STAGING_INCDIR)/ime
+-
+-#LIBS += -lnapp -lnrwindow
++INCLUDEPATH += $$(STAGING_INCDIR)/ime \
++               $$(STAGING_INCDIR)/sysmgr-ipc
+ 
+ QMAKE_CXXFLAGS += -fno-rtti -fno-exceptions
+ 
+-- 
+1.7.10.4
+
